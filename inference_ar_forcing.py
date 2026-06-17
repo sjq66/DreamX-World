@@ -26,13 +26,13 @@ import json
 import os
 
 import cv2
+import imageio.v2 as imageio
 import numpy as np
 import torch
 from einops import rearrange
 from omegaconf import OmegaConf
 from PIL import Image
 from torchvision import transforms
-from torchvision.io import write_video
 import torch.nn.functional as F
 
 from pipeline.pipeline_causal_camera import CausalCameraInferencePipeline
@@ -222,6 +222,32 @@ def maybe_enable_eprope_from_checkpoint(args, config):
                 f"({q_proj_key} shape={q_proj_shape}); enabling eprope "
                 f"(attn_compress={compress})."
             )
+
+
+def save_video(output_path, frames, fps):
+    """Write RGB video frames with imageio/ffmpeg.
+
+    torchvision.io.write_video is brittle with newer PyAV versions because it
+    sets VideoFrame.pict_type to a string. imageio uses ffmpeg directly and is
+    stable in the current uv environment.
+    """
+    if isinstance(frames, torch.Tensor):
+        frames = frames.detach().cpu().clamp(0, 255).to(torch.uint8).numpy()
+    else:
+        frames = np.asarray(frames).clip(0, 255).astype(np.uint8)
+
+    if frames.ndim != 4 or frames.shape[-1] != 3:
+        raise ValueError(f"Expected RGB frames with shape [T,H,W,3], got {frames.shape}")
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    imageio.mimwrite(
+        output_path,
+        frames,
+        fps=fps,
+        codec="libx264",
+        quality=8,
+        macro_block_size=1,
+    )
 
 
 def load_pipeline(args, config, device):
@@ -417,7 +443,7 @@ def main():
             color_correction_strength=args.color_correction_strength,
         )
 
-        write_video(output_path, video[0], fps=args.fps)
+        save_video(output_path, video[0], fps=args.fps)
         print(f"    Saved: {output_path}")
 
     print("Done.")
