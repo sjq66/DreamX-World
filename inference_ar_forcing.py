@@ -164,6 +164,20 @@ def parse_args():
     parser.add_argument("--chunk_relative", action="store_true",
                         help="Compute relative camera poses per chunk (chunk_size=3) instead of globally")
 
+    # KV cache eviction
+    parser.add_argument("--kv_evict_policy", type=str, default="fifo",
+                        choices=["fifo", "similarity"],
+                        help="KV cache eviction policy for the AR self-attention cache")
+    parser.add_argument("--kv_similarity_threshold", type=float, default=0.95,
+                        help="Cosine threshold for similarity-based KV chunk eviction")
+    parser.add_argument("--kv_similarity_recent_keep_chunks", type=int, default=1,
+                        help="Number of most recent non-sink chunks protected from similarity eviction")
+    parser.add_argument("--kv_similarity_source", type=str, default="k",
+                        choices=["k", "v", "kv"],
+                        help="Cache tensor used for average-pooled chunk similarity")
+    parser.add_argument("--kv_similarity_debug", action="store_true",
+                        help="Print similarity-eviction decisions during AR inference")
+
     # LoRA
     parser.add_argument("--lora_ckpt", type=str, default=None,
                         help="Path to LoRA checkpoint (requires adapter section in config)")
@@ -286,6 +300,20 @@ def main():
 
     num_pixel_frames = (args.num_output_frames - 1) * 4 + 1
     os.makedirs(args.output_folder, exist_ok=True)
+    kv_cache_policy = {
+        "policy": args.kv_evict_policy,
+        "similarity_threshold": args.kv_similarity_threshold,
+        "recent_keep_chunks": args.kv_similarity_recent_keep_chunks,
+        "similarity_source": args.kv_similarity_source,
+        "debug": args.kv_similarity_debug,
+    }
+    if args.kv_evict_policy != "fifo":
+        print(
+            "KV cache policy: "
+            f"{args.kv_evict_policy}, threshold={args.kv_similarity_threshold}, "
+            f"recent_keep_chunks={args.kv_similarity_recent_keep_chunks}, "
+            f"source={args.kv_similarity_source}"
+        )
 
     # ─── Inference loop ───
     for idx, item in enumerate(items):
@@ -332,6 +360,7 @@ def main():
             y=None,
             y_camera=control_camera,
             return_latents=True,
+            kv_cache_policy=kv_cache_policy,
         )
 
         # 5) Post-process and save video

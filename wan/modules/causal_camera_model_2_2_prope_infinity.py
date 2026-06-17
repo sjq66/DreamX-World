@@ -10,6 +10,7 @@ from wan.modules.model_2_2 import (
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 import torch.nn as nn
+import torch.nn.functional as F
 import torch
 import math
 
@@ -78,8 +79,121 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    @staticmethod
+    def _pooled_summary(tensor):
+        summary = tensor.float().mean(dim=1).flatten(1)
+        return F.normalize(summary, dim=-1, eps=1e-6)
+
+    def _build_chunk_summary(self, key_tensor, value_tensor, source):
+        if source == "v":
+            return self._pooled_summary(value_tensor)
+        if source == "kv":
+            return F.normalize(torch.cat([
+                self._pooled_summary(key_tensor),
+                self._pooled_summary(value_tensor),
+            ], dim=-1), dim=-1, eps=1e-6)
+        return self._pooled_summary(key_tensor)
+
+    def _select_eviction_plan(
+        self,
+        k,
+        v,
+        kv_cache,
+        sink_tokens,
+        num_new_tokens,
+        num_evicted_tokens,
+        cache_policy,
+        cache_policy_state,
+    ):
+        fifo_plan = {
+            "evict_start_index": sink_tokens,
+            "policy": "fifo",
+            "best_similarity": None,
+            "threshold": None,
+            "reason": "fifo",
+        }
+
+        if cache_policy_state is not None and "eviction_plan" in cache_policy_state:
+            return cache_policy_state["eviction_plan"]
+
+        if not cache_policy or cache_policy.get("policy", "fifo") != "similarity":
+            if cache_policy_state is not None:
+                cache_policy_state["eviction_plan"] = fifo_plan
+            return fifo_plan
+
+        old_local_end = kv_cache["local_end_index"].item()
+        threshold = float(cache_policy.get("similarity_threshold", 0.95))
+        recent_keep_chunks = max(0, int(cache_policy.get("recent_keep_chunks", 1)))
+        source = cache_policy.get("similarity_source", "k")
+
+        # First validation keeps the eviction unit equal to the incoming chunk.
+        # That preserves chunk boundaries and keeps RoPE on a compact local timeline.
+        if num_evicted_tokens != num_new_tokens or old_local_end <= sink_tokens:
+            plan = dict(fifo_plan, threshold=threshold, reason="unsupported_shape")
+            if cache_policy_state is not None:
+                cache_policy_state["eviction_plan"] = plan
+            return plan
+
+        candidate_start = sink_tokens
+        candidate_limit = old_local_end - recent_keep_chunks * num_new_tokens
+        candidate_starts = list(range(candidate_start, candidate_limit - num_evicted_tokens + 1, num_evicted_tokens))
+        if not candidate_starts:
+            plan = dict(fifo_plan, threshold=threshold, reason="no_candidates")
+            if cache_policy_state is not None:
+                cache_policy_state["eviction_plan"] = plan
+            return plan
+
+        new_summary = self._build_chunk_summary(
+            k[:, :num_new_tokens],
+            v[:, :num_new_tokens],
+            source,
+        )
+
+        candidate_summaries = []
+        for start in candidate_starts:
+            candidate_summaries.append(self._build_chunk_summary(
+                kv_cache["k"][:, start:start + num_evicted_tokens],
+                kv_cache["v"][:, start:start + num_evicted_tokens],
+                source,
+            ))
+        candidate_summaries = torch.stack(candidate_summaries, dim=1)
+        similarities = (candidate_summaries * new_summary[:, None, :]).sum(dim=-1).mean(dim=0)
+        best_similarity, best_idx = similarities.max(dim=0)
+        best_similarity_value = float(best_similarity.item())
+
+        if best_similarity_value >= threshold:
+            plan = {
+                "evict_start_index": candidate_starts[int(best_idx.item())],
+                "policy": "similarity",
+                "best_similarity": best_similarity_value,
+                "threshold": threshold,
+                "reason": "similarity_match",
+            }
+        else:
+            plan = dict(
+                fifo_plan,
+                threshold=threshold,
+                best_similarity=best_similarity_value,
+                reason="below_threshold",
+            )
+
+        if cache_policy.get("debug", False) and cache_policy_state is not None and not cache_policy_state.get("debug_logged", False):
+            layer_idx = getattr(self, "layer_idx", "?")
+            print(
+                "[kv-evict] "
+                f"layer={layer_idx} policy={plan['policy']} reason={plan['reason']} "
+                f"evict_start={plan['evict_start_index']} best_sim={plan['best_similarity']} "
+                f"threshold={plan['threshold']}"
+            )
+            cache_policy_state["debug_logged"] = True
+
+        if cache_policy_state is not None:
+            cache_policy_state["eviction_plan"] = plan
+        return plan
+
     def forward(self, x, seq_lens, grid_sizes, freqs, kv_cache,
-                current_start=0, cache_start=None, sink_recache_after_switch=False):
+                current_start=0, cache_start=None, sink_recache_after_switch=False,
+                cache_policy=None, cache_policy_state=None):
         """
         Args:
             x: Shape [B, L, C]
@@ -109,19 +223,27 @@ class CausalWanSelfAttention(nn.Module):
 
         if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                 num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-            # === ROLLING MODE: cache full, evict oldest non-sink tokens ===
+            # === ROLLING MODE: cache full, evict a non-sink chunk ===
             num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
             num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
             local_end_index = kv_cache["local_end_index"].item() + current_end - \
                 kv_cache["global_end_index"].item() - num_evicted_tokens
             local_start_index = local_end_index - num_new_tokens
+            eviction_plan = self._select_eviction_plan(
+                k, v, kv_cache, sink_tokens, num_new_tokens, num_evicted_tokens,
+                cache_policy, cache_policy_state)
+            evict_start_index = eviction_plan["evict_start_index"]
 
             temp_k = kv_cache["k"].detach().clone()
             temp_v = kv_cache["v"].detach().clone()
-            temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-            temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                temp_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+            preserved_after_tokens = kv_cache["local_end_index"].item() - evict_start_index - num_evicted_tokens
+            if preserved_after_tokens > 0:
+                temp_k[:, evict_start_index:evict_start_index + preserved_after_tokens] = \
+                    temp_k[:, evict_start_index + num_evicted_tokens:
+                           evict_start_index + num_evicted_tokens + preserved_after_tokens].clone()
+                temp_v[:, evict_start_index:evict_start_index + preserved_after_tokens] = \
+                    temp_v[:, evict_start_index + num_evicted_tokens:
+                           evict_start_index + num_evicted_tokens + preserved_after_tokens].clone()
 
             write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
             roped_offset = max(0, write_start_index - local_start_index)
@@ -150,6 +272,7 @@ class CausalWanSelfAttention(nn.Module):
                 "sink_tokens": sink_tokens,
                 "num_rolled_tokens": num_rolled_tokens,
                 "num_evicted_tokens": num_evicted_tokens,
+                "evict_start_index": evict_start_index,
                 "local_start_index": local_start_index,
                 "local_end_index": local_end_index,
                 "write_start_index": write_start_index,
@@ -417,7 +540,8 @@ class CausalWanAttentionBlock(nn.Module):
     def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens,
                 kv_cache, crossattn_cache=None, current_start=0, cache_start=None,
                 cam_viewmats=None, cam_K=None, sink_recache_after_switch=False,
-                cache_update_policy="commit_detached"):
+                cache_update_policy="commit_detached", cache_policy=None,
+                cache_policy_state=None):
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
 
@@ -426,7 +550,8 @@ class CausalWanAttentionBlock(nn.Module):
             dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2)
         y, cache_update_info = self.self_attn(
             attn_input, seq_lens, grid_sizes, freqs, kv_cache,
-            current_start, cache_start, sink_recache_after_switch)
+            current_start, cache_start, sink_recache_after_switch,
+            cache_policy=cache_policy, cache_policy_state=cache_policy_state)
 
         # PRoPE camera attention (parallel branch)
         if hasattr(self, 'cam_self_attn') and cam_viewmats is not None and cam_K is not None:
@@ -572,7 +697,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     def forward(self, x, t, context, seq_len, y=None, y_camera=None,
                 kv_cache=None, crossattn_cache=None, current_start=0,
-                cache_start=0, cache_update_policy="commit_detached", **kwargs):
+                cache_start=0, cache_update_policy="commit_detached",
+                kv_cache_policy=None, **kwargs):
         """
         Causal inference with KV caching.
         See Algorithm 2 of CausVid (https://arxiv.org/abs/2412.07772).
@@ -589,6 +715,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             current_start: Current position in global token sequence
             cache_start: Cache start position
             cache_update_policy: Cache update strategy ('commit_detached' or 'none')
+            kv_cache_policy: Optional content-aware KV eviction settings
 
         Returns:
             Stacked output tensors [B, C_out, F, H/8, W/8]
@@ -637,8 +764,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context=context, context_lens=context_lens,
             cam_viewmats=cam_viewmats, cam_K=cam_K,
             cache_update_policy=cache_update_policy,
+            cache_policy=kv_cache_policy,
         )
 
+        cache_policy_state = {} if kv_cache_policy is not None else None
         cache_update_infos = []
         for block_index, block in enumerate(self.blocks):
             block_kwargs.update({
@@ -646,6 +775,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 "crossattn_cache": crossattn_cache[block_index] if crossattn_cache is not None else None,
                 "current_start": current_start,
                 "cache_start": cache_start,
+                "cache_policy_state": cache_policy_state,
             })
             x, block_cache_update_info = block(x, **block_kwargs)
             if kv_cache is not None:
@@ -673,18 +803,22 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     cache = kv_cache[block_index]
 
                     if update_info["action"] == "roll_and_insert":
-                        sink_tokens = update_info["sink_tokens"]
-                        num_rolled_tokens = update_info["num_rolled_tokens"]
                         num_evicted_tokens = update_info["num_evicted_tokens"]
+                        evict_start_index = update_info.get("evict_start_index", update_info["sink_tokens"])
                         write_start_index = update_info.get("write_start_index", update_info["local_start_index"])
                         write_end_index = update_info.get("write_end_index", update_info["local_end_index"])
                         new_k = update_info["new_k"].detach()
                         new_v = update_info["new_v"].detach()
+                        old_local_end = cache["local_end_index"].item()
+                        preserved_after_tokens = old_local_end - evict_start_index - num_evicted_tokens
 
-                        cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                            cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                        cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                            cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                        if preserved_after_tokens > 0:
+                            cache["k"][:, evict_start_index:evict_start_index + preserved_after_tokens] = \
+                                cache["k"][:, evict_start_index + num_evicted_tokens:
+                                           evict_start_index + num_evicted_tokens + preserved_after_tokens].clone()
+                            cache["v"][:, evict_start_index:evict_start_index + preserved_after_tokens] = \
+                                cache["v"][:, evict_start_index + num_evicted_tokens:
+                                           evict_start_index + num_evicted_tokens + preserved_after_tokens].clone()
 
                         if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
                             cache["k"][:, write_start_index:write_end_index] = new_k

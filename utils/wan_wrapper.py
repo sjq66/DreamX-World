@@ -158,6 +158,7 @@ class WanDiffusionCameraWrapper(torch.nn.Module):
         current_start: Optional[int] = None,
         cache_start: Optional[int] = None,
         cache_update_policy: str = "commit_detached",
+        kv_cache_policy: Optional[dict] = None,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
         skip_length = noisy_image_or_video.shape[-1] * noisy_image_or_video.shape[-2] // 4
@@ -177,6 +178,7 @@ class WanDiffusionCameraWrapper(torch.nn.Module):
             current_start=current_start,
             cache_start=cache_start,
             cache_update_policy=cache_update_policy,
+            kv_cache_policy=kv_cache_policy,
         ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(

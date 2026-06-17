@@ -54,6 +54,7 @@ class CausalCameraInferencePipeline(torch.nn.Module):
         return_latents: bool = False,
         profile: bool = True,
         low_memory: bool = False,
+        kv_cache_policy: Optional[dict] = None,
     ) -> torch.Tensor:
         batch_size, num_frames, num_channels, height, width = noise.shape
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
@@ -116,6 +117,7 @@ class CausalCameraInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
+                    kv_cache_policy=kv_cache_policy,
                 )
                 current_start_frame += 1
             else:
@@ -135,6 +137,7 @@ class CausalCameraInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
+                    kv_cache_policy=kv_cache_policy,
                 )
                 current_start_frame += self.num_frame_per_block
 
@@ -188,7 +191,8 @@ class CausalCameraInferencePipeline(torch.nn.Module):
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length)
+                        current_start=current_start_frame * self.frame_seq_length,
+                        kv_cache_policy=kv_cache_policy)
                     next_timestep = self.denoising_step_list[index + 1]
                     next_timestep = next_timestep * torch.ones(
                         [batch_size, current_num_frames], device=noise.device, dtype=torch.long)
@@ -208,7 +212,8 @@ class CausalCameraInferencePipeline(torch.nn.Module):
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length)
+                        current_start=current_start_frame * self.frame_seq_length,
+                        kv_cache_policy=kv_cache_policy)
                     denoised_pred = denoised_pred * first_frame_mask_block + noisy_input * (1 - first_frame_mask_block)
 
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
@@ -223,6 +228,7 @@ class CausalCameraInferencePipeline(torch.nn.Module):
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
+                kv_cache_policy=kv_cache_policy,
             )
 
             if profile:
