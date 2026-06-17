@@ -184,8 +184,50 @@ def parse_args():
     return parser.parse_args()
 
 
+def maybe_enable_eprope_from_checkpoint(args, config):
+    """Match PRoPE attention compression to DreamX safetensors checkpoints."""
+    checkpoint_path = args.checkpoint_path
+    if not checkpoint_path or not checkpoint_path.endswith(".safetensors"):
+        return
+
+    try:
+        from safetensors import safe_open
+        with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+            q_proj_key = None
+            for candidate in (
+                "blocks.0.cam_self_attn.q_proj.weight",
+                "model.blocks.0.cam_self_attn.q_proj.weight",
+            ):
+                if candidate in keys:
+                    q_proj_key = candidate
+                    break
+            if q_proj_key is None:
+                return
+            q_proj_shape = tuple(f.get_tensor(q_proj_key).shape)
+    except Exception as exc:
+        print(f"Warning: failed to inspect checkpoint shape for eprope auto-detect: {exc}")
+        return
+
+    if len(q_proj_shape) != 2:
+        return
+
+    out_dim, in_dim = q_proj_shape
+    if out_dim < in_dim and in_dim % out_dim == 0:
+        compress = in_dim // out_dim
+        if compress > 1:
+            config.model_kwargs.eprope = True
+            print(
+                "Detected compressed PRoPE checkpoint "
+                f"({q_proj_key} shape={q_proj_shape}); enabling eprope "
+                f"(attn_compress={compress})."
+            )
+
+
 def load_pipeline(args, config, device):
     """Load the CausalCameraInferencePipeline with checkpoints."""
+    maybe_enable_eprope_from_checkpoint(args, config)
+
     # Build explicit paths from --model_name and --transformer_path if provided
     text_encoder_path = None
     tokenizer_path = None
