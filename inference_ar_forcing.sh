@@ -13,7 +13,8 @@
 MODEL_NAME="${MODEL_NAME:-./Wan2.2-TI2V-5B}"   # Path to the folder containing Wan2.2 base model weights (text encoder, tokenizer, VAE).
 CONFIG_PATH="configs/dreamx-ar/causal_camera_forcing_5b.yaml"  # Path to AR-forcing YAML config file.
 TRANSFORMER_PATH="./configs/dreamx-ar/"  # Path to the folder containing AR-forcing model config.json.
-BASE_CHECKPOINT_PATH="${BASE_CHECKPOINT_PATH:-/path/to/baseline.pt}"  # Path to base .pt checkpoint.
+BASE_CHECKPOINT_PATH="${BASE_CHECKPOINT_PATH-./DreamX-World-5B/baseline.pt}"  # Path to base .pt checkpoint.
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"  # Optional additional .pt/.safetensors checkpoint or checkpoint directory.
 # VAE_PATH=""                    # (Optional) Path to VAE checkpoint, overrides MODEL_NAME/Wan2.2_VAE.pth.
 
 # ====================== Basic settings ======================
@@ -40,7 +41,12 @@ CMD="python inference_ar_forcing.py"
 CMD="${CMD} --config_path ${CONFIG_PATH}"
 CMD="${CMD} --model_name ${MODEL_NAME}"
 CMD="${CMD} --transformer_path ${TRANSFORMER_PATH}"
-CMD="${CMD} --base_checkpoint_path ${BASE_CHECKPOINT_PATH}"
+if [ -n "${BASE_CHECKPOINT_PATH}" ]; then
+    CMD="${CMD} --base_checkpoint_path ${BASE_CHECKPOINT_PATH}"
+fi
+if [ -n "${CHECKPOINT_PATH}" ]; then
+    CMD="${CMD} --checkpoint_path ${CHECKPOINT_PATH}"
+fi
 if [ -n "${VAE_PATH}" ]; then
     CMD="${CMD} --vae_path ${VAE_PATH}"
 fi
