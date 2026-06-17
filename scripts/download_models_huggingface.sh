@@ -108,9 +108,10 @@ for repo_id, local_dir in downloads:
 PY
 
 base_checkpoint_path="$(
-  find "${DREAMX_DIR}" -type f \( -name "*.pt" -o -name "*.pth" \) \
-    | sort \
-    | head -n 1
+  find "${DREAMX_DIR}" -type f \( -name "*.pt" -o -name "*.pth" \) ! -path "*/.*/*" -printf "%s %p\n" \
+    | sort -nr \
+    | head -n 1 \
+    | cut -d' ' -f2-
 )"
 checkpoint_path=""
 
@@ -122,9 +123,10 @@ if [[ -n "${base_checkpoint_path}" ]]; then
   base_checkpoint_for_env="${baseline_link}"
 else
   checkpoint_path="$(
-    find "${DREAMX_DIR}" -type f -name "*.safetensors" \
-      | sort \
-      | head -n 1
+    find "${DREAMX_DIR}" -type f -name "*.safetensors" ! -path "*/.*/*" -printf "%s %p\n" \
+      | sort -nr \
+      | head -n 1 \
+      | cut -d' ' -f2-
   )"
   base_checkpoint_for_env=""
 fi

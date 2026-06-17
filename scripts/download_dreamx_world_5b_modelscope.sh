@@ -61,9 +61,10 @@ print(f"Downloaded {model_id} to {model_dir}")
 PY
 
 base_checkpoint_path="$(
-  find "${MODEL_DIR}" -type f \( -name "*.pt" -o -name "*.pth" \) \
-    | sort \
-    | head -n 1
+  find "${MODEL_DIR}" -type f \( -name "*.pt" -o -name "*.pth" \) ! -path "*/.*/*" -printf "%s %p\n" \
+    | sort -nr \
+    | head -n 1 \
+    | cut -d' ' -f2-
 )"
 checkpoint_path=""
 
@@ -75,9 +76,10 @@ if [[ -n "${base_checkpoint_path}" ]]; then
   checkpoint_for_env="${baseline_link}"
 else
   checkpoint_path="$(
-    find "${MODEL_DIR}" -type f -name "*.safetensors" \
-      | sort \
-      | head -n 1
+    find "${MODEL_DIR}" -type f -name "*.safetensors" ! -path "*/.*/*" -printf "%s %p\n" \
+      | sort -nr \
+      | head -n 1 \
+      | cut -d' ' -f2-
   )"
   checkpoint_for_env="${checkpoint_path}"
 fi
