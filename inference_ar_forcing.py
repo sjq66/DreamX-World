@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import os
 
@@ -156,6 +157,10 @@ def parse_args():
     parser.add_argument("--num_output_frames", type=int, default=21)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fps", type=int, default=16)
+    parser.add_argument("--local_attn_size", type=int, default=None,
+                        help="Override AR self-attention local window size in latent frames")
+    parser.add_argument("--sink_size", type=int, default=None,
+                        help="Override number of sink latent frames kept at the cache front")
 
     # Post-processing
     parser.add_argument("--color_correction_strength", type=float, default=0.3)
@@ -177,6 +182,8 @@ def parse_args():
                         help="Cache tensor used for average-pooled chunk similarity")
     parser.add_argument("--kv_similarity_debug", action="store_true",
                         help="Print similarity-eviction decisions during AR inference")
+    parser.add_argument("--kv_eviction_log_path", type=str, default=None,
+                        help="Optional CSV path for per-roll KV eviction decisions")
 
     # LoRA
     parser.add_argument("--lora_ckpt", type=str, default=None,
@@ -254,6 +261,11 @@ def load_pipeline(args, config, device):
     """Load the CausalCameraInferencePipeline with checkpoints."""
     maybe_enable_eprope_from_checkpoint(args, config)
 
+    if args.local_attn_size is not None:
+        config.model_kwargs.local_attn_size = args.local_attn_size
+    if args.sink_size is not None:
+        config.model_kwargs.sink_size = args.sink_size
+
     # Build explicit paths from --model_name and --transformer_path if provided
     text_encoder_path = None
     tokenizer_path = None
@@ -329,6 +341,34 @@ def load_pipeline(args, config, device):
     return pipeline
 
 
+def write_kv_eviction_rows(log_path, rows, fieldnames):
+    if not log_path or not rows:
+        return
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    write_header = not os.path.exists(log_path)
+    with open(log_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def estimate_kv_cache_gb(pipeline, dtype_bytes=2):
+    local_attn_size = pipeline.generator.model.local_attn_size
+    if local_attn_size == -1:
+        return float("nan")
+    num_blocks = getattr(pipeline, "num_transformer_blocks", 30)
+    frame_seq_length = getattr(pipeline, "frame_seq_length", 880)
+    num_heads = 24
+    head_dim = 128
+    tensors_per_cache = 2  # K and V
+    total_bytes = (
+        num_blocks * local_attn_size * frame_seq_length *
+        num_heads * head_dim * tensors_per_cache * dtype_bytes
+    )
+    return total_bytes / (1024 ** 3)
+
+
 def main():
     args = parse_args()
     device = torch.device("cuda")
@@ -347,6 +387,12 @@ def main():
     # Load pipeline
     pipeline = load_pipeline(args, config, device)
     pipeline = pipeline.to(dtype=torch.bfloat16)
+    print(
+        "KV cache config: "
+        f"local_attn_size={pipeline.generator.model.local_attn_size}, "
+        f"sink_size={pipeline.generator.model.sink_size}, "
+        f"estimated_kv_cache={estimate_kv_cache_gb(pipeline):.2f} GiB"
+    )
     if low_memory:
         DynamicSwapInstaller.install_model(pipeline.text_encoder, device=gpu)
     else:
@@ -374,13 +420,26 @@ def main():
         "recent_keep_chunks": args.kv_similarity_recent_keep_chunks,
         "similarity_source": args.kv_similarity_source,
         "debug": args.kv_similarity_debug,
+        "stats": [],
     }
+    kv_eviction_fields = [
+        "task_id", "output_name", "event_index", "layer", "policy", "reason",
+        "best_similarity", "threshold", "evict_start_index", "fifo_start_index",
+        "chosen_is_fifo", "num_candidates", "num_new_tokens", "num_evicted_tokens",
+        "old_local_end", "global_end_index", "candidate_starts",
+        "candidate_similarities",
+    ]
     if args.kv_evict_policy != "fifo":
         print(
             "KV cache policy: "
             f"{args.kv_evict_policy}, threshold={args.kv_similarity_threshold}, "
             f"recent_keep_chunks={args.kv_similarity_recent_keep_chunks}, "
             f"source={args.kv_similarity_source}"
+        )
+    if args.local_attn_size is not None or args.sink_size is not None:
+        print(
+            "KV cache window override: "
+            f"local_attn_size={args.local_attn_size}, sink_size={args.sink_size}"
         )
 
     # ─── Inference loop ───
@@ -400,6 +459,8 @@ def main():
             continue
 
         print(f"[{idx}] Generating: {output_path}")
+        stats_start = len(kv_cache_policy["stats"])
+        torch.cuda.reset_peak_memory_stats(device)
 
         # 1) Encode input image
         pil_image = Image.open(image_path).convert('RGB')
@@ -445,6 +506,22 @@ def main():
 
         save_video(output_path, video[0], fps=args.fps)
         print(f"    Saved: {output_path}")
+        print(f"    Peak reserved VRAM: {torch.cuda.max_memory_reserved(device) / (1024 ** 3):.2f} GiB")
+
+        new_stats = kv_cache_policy["stats"][stats_start:]
+        rows = []
+        for event_offset, stat in enumerate(new_stats):
+            row = {field: "" for field in kv_eviction_fields}
+            row.update(stat)
+            row["task_id"] = task_id
+            row["output_name"] = output_name
+            row["event_index"] = stats_start + event_offset
+            if isinstance(row.get("candidate_starts"), list):
+                row["candidate_starts"] = ";".join(str(v) for v in row["candidate_starts"])
+            if isinstance(row.get("candidate_similarities"), list):
+                row["candidate_similarities"] = ";".join(f"{v:.6f}" for v in row["candidate_similarities"])
+            rows.append(row)
+        write_kv_eviction_rows(args.kv_eviction_log_path, rows, kv_eviction_fields)
 
     print("Done.")
 

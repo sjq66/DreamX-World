@@ -111,7 +111,32 @@ class CausalWanSelfAttention(nn.Module):
             "best_similarity": None,
             "threshold": None,
             "reason": "fifo",
+            "candidate_starts": [],
+            "candidate_similarities": [],
         }
+
+        def record_plan(plan, old_local_end=None, global_end_index=None, candidate_starts=None):
+            stats = cache_policy.get("stats") if cache_policy else None
+            if not isinstance(stats, list):
+                return
+            starts = candidate_starts if candidate_starts is not None else plan.get("candidate_starts", [])
+            stats.append({
+                "layer": getattr(self, "layer_idx", "?"),
+                "policy": plan["policy"],
+                "reason": plan["reason"],
+                "best_similarity": plan["best_similarity"],
+                "threshold": plan["threshold"],
+                "evict_start_index": plan["evict_start_index"],
+                "fifo_start_index": sink_tokens,
+                "chosen_is_fifo": plan["evict_start_index"] == sink_tokens,
+                "num_candidates": len(starts),
+                "num_new_tokens": num_new_tokens,
+                "num_evicted_tokens": num_evicted_tokens,
+                "old_local_end": old_local_end if old_local_end is not None else "",
+                "global_end_index": global_end_index if global_end_index is not None else "",
+                "candidate_starts": starts,
+                "candidate_similarities": plan.get("candidate_similarities", []),
+            })
 
         if cache_policy_state is not None and "eviction_plan" in cache_policy_state:
             return cache_policy_state["eviction_plan"]
@@ -119,9 +144,11 @@ class CausalWanSelfAttention(nn.Module):
         if not cache_policy or cache_policy.get("policy", "fifo") != "similarity":
             if cache_policy_state is not None:
                 cache_policy_state["eviction_plan"] = fifo_plan
+            record_plan(fifo_plan)
             return fifo_plan
 
         old_local_end = kv_cache["local_end_index"].item()
+        global_end_index = kv_cache["global_end_index"].item()
         threshold = float(cache_policy.get("similarity_threshold", 0.95))
         recent_keep_chunks = max(0, int(cache_policy.get("recent_keep_chunks", 1)))
         source = cache_policy.get("similarity_source", "k")
@@ -132,6 +159,7 @@ class CausalWanSelfAttention(nn.Module):
             plan = dict(fifo_plan, threshold=threshold, reason="unsupported_shape")
             if cache_policy_state is not None:
                 cache_policy_state["eviction_plan"] = plan
+            record_plan(plan, old_local_end, global_end_index)
             return plan
 
         candidate_start = sink_tokens
@@ -141,6 +169,7 @@ class CausalWanSelfAttention(nn.Module):
             plan = dict(fifo_plan, threshold=threshold, reason="no_candidates")
             if cache_policy_state is not None:
                 cache_policy_state["eviction_plan"] = plan
+            record_plan(plan, old_local_end, global_end_index, candidate_starts)
             return plan
 
         new_summary = self._build_chunk_summary(
@@ -158,6 +187,7 @@ class CausalWanSelfAttention(nn.Module):
             ))
         candidate_summaries = torch.stack(candidate_summaries, dim=1)
         similarities = (candidate_summaries * new_summary[:, None, :]).sum(dim=-1).mean(dim=0)
+        similarity_values = [float(v) for v in similarities.detach().cpu().tolist()]
         best_similarity, best_idx = similarities.max(dim=0)
         best_similarity_value = float(best_similarity.item())
 
@@ -168,6 +198,8 @@ class CausalWanSelfAttention(nn.Module):
                 "best_similarity": best_similarity_value,
                 "threshold": threshold,
                 "reason": "similarity_match",
+                "candidate_starts": candidate_starts,
+                "candidate_similarities": similarity_values,
             }
         else:
             plan = dict(
@@ -175,7 +207,11 @@ class CausalWanSelfAttention(nn.Module):
                 threshold=threshold,
                 best_similarity=best_similarity_value,
                 reason="below_threshold",
+                candidate_starts=candidate_starts,
+                candidate_similarities=similarity_values,
             )
+
+        record_plan(plan, old_local_end, global_end_index, candidate_starts)
 
         if cache_policy.get("debug", False) and cache_policy_state is not None and not cache_policy_state.get("debug_logged", False):
             layer_idx = getattr(self, "layer_idx", "?")
