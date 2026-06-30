@@ -355,6 +355,8 @@ class CausalWanSelfAttention(nn.Module):
             # === DIRECT INSERT MODE: cache not yet full ===
             local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
             local_start_index = local_end_index - num_new_tokens
+            final_local_end_index = local_end_index
+            final_local_start_index = local_start_index
 
             temp_k = kv_cache["k"].detach().clone()
             temp_v = kv_cache["v"].detach().clone()
@@ -368,32 +370,100 @@ class CausalWanSelfAttention(nn.Module):
                 temp_k[:, write_start_index:local_end_index] = k[:, roped_offset:roped_offset + write_len]
                 temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
 
+            direct_compact_info = None
+            policy = cache_policy.get("policy", "fifo") if cache_policy else "fifo"
+            num_evicted_tokens = num_new_tokens
+            if policy == "stride" and not is_recompute:
+                recent_keep_chunks = max(0, int(cache_policy.get("recent_keep_chunks", 1)))
+                anchor_chunks = max(0, int(cache_policy.get("stride_anchor_chunks", 1)))
+                candidate_limit = local_end_index - recent_keep_chunks * num_new_tokens
+                candidate_starts = list(range(
+                    sink_tokens,
+                    candidate_limit - num_new_tokens + 1,
+                    num_new_tokens,
+                ))
+                if cache_policy_state is not None and "stride_direct_plan" in cache_policy_state:
+                    plan = cache_policy_state["stride_direct_plan"]
+                elif len(candidate_starts) > anchor_chunks:
+                    plan = {
+                        "evict_start_index": candidate_starts[anchor_chunks],
+                        "policy": "stride",
+                        "best_similarity": None,
+                        "threshold": cache_policy.get("similarity_threshold"),
+                        "reason": f"eager_preserve_{anchor_chunks}_oldest_then_evict",
+                        "candidate_starts": candidate_starts,
+                        "candidate_similarities": [],
+                    }
+                    if cache_policy_state is not None:
+                        cache_policy_state["stride_direct_plan"] = plan
+                    stats = cache_policy.get("stats")
+                    if isinstance(stats, list):
+                        stats.append({
+                            "layer": getattr(self, "layer_idx", "?"),
+                            "policy": plan["policy"],
+                            "reason": plan["reason"],
+                            "best_similarity": plan["best_similarity"],
+                            "threshold": plan["threshold"],
+                            "evict_start_index": plan["evict_start_index"],
+                            "fifo_start_index": sink_tokens,
+                            "chosen_is_fifo": plan["evict_start_index"] == sink_tokens,
+                            "num_candidates": len(candidate_starts),
+                            "num_new_tokens": num_new_tokens,
+                            "num_evicted_tokens": num_evicted_tokens,
+                            "old_local_end": kv_cache["local_end_index"].item(),
+                            "global_end_index": kv_cache["global_end_index"].item(),
+                            "candidate_starts": candidate_starts,
+                            "candidate_similarities": [],
+                        })
+                else:
+                    plan = None
+
+                if plan is not None:
+                    evict_start_index = plan["evict_start_index"]
+                    preserved_after_tokens = local_end_index - evict_start_index - num_evicted_tokens
+                    if preserved_after_tokens > 0:
+                        temp_k[:, evict_start_index:evict_start_index + preserved_after_tokens] = \
+                            temp_k[:, evict_start_index + num_evicted_tokens:
+                                   evict_start_index + num_evicted_tokens + preserved_after_tokens].clone()
+                        temp_v[:, evict_start_index:evict_start_index + preserved_after_tokens] = \
+                            temp_v[:, evict_start_index + num_evicted_tokens:
+                                   evict_start_index + num_evicted_tokens + preserved_after_tokens].clone()
+                    final_local_end_index = local_end_index - num_evicted_tokens
+                    final_local_start_index = local_start_index - num_evicted_tokens \
+                        if evict_start_index < local_start_index else local_start_index
+                    direct_compact_info = {
+                        "num_evicted_tokens": num_evicted_tokens,
+                        "evict_start_index": evict_start_index,
+                    }
+
             # RoPE with relative indices (growing sequentially before cache fills)
-            current_frame_in_window = local_start_index // frame_seqlen
+            current_frame_in_window = final_local_start_index // frame_seqlen
             query_relative_indices = torch.arange(
                 current_frame_in_window, current_frame_in_window + num_new_frames, device=q.device)
             roped_query = block_relativistic_rope(
                 q, grid_sizes, freqs, relative_frame_indices=query_relative_indices).type_as(v)
 
-            num_cache_frames = local_end_index // frame_seqlen
+            num_cache_frames = final_local_end_index // frame_seqlen
             cache_relative_indices = torch.arange(0, num_cache_frames, device=k.device)
             cache_grid_sizes = grid_sizes.clone()
             cache_grid_sizes[0, 0] = num_cache_frames
             roped_temp_k = block_relativistic_rope(
-                temp_k[:, :local_end_index].view(b, num_cache_frames, frame_seqlen, n, d).flatten(1, 2),
+                temp_k[:, :final_local_end_index].view(b, num_cache_frames, frame_seqlen, n, d).flatten(1, 2),
                 cache_grid_sizes, freqs, relative_frame_indices=cache_relative_indices).type_as(v)
 
             cache_update_info = {
                 "action": "direct_insert",
-                "local_start_index": local_start_index,
-                "local_end_index": local_end_index,
+                "local_start_index": final_local_start_index,
+                "local_end_index": final_local_end_index,
                 "write_start_index": write_start_index,
                 "write_end_index": local_end_index,
                 "new_k": k[:, roped_offset:roped_offset + write_len],
                 "new_v": v[:, roped_offset:roped_offset + write_len],
                 "current_end": current_end,
-                "is_recompute": is_recompute
+                "is_recompute": is_recompute,
+                "direct_compact_info": direct_compact_info,
             }
+            local_end_index = final_local_end_index
 
         # Attention: sink tokens + local window
         if sink_tokens > 0:
@@ -902,6 +972,20 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
                             cache["k"][:, write_start_index:write_end_index] = new_k
                             cache["v"][:, write_start_index:write_end_index] = new_v
+
+                        direct_compact_info = update_info.get("direct_compact_info")
+                        if direct_compact_info is not None:
+                            num_evicted_tokens = direct_compact_info["num_evicted_tokens"]
+                            evict_start_index = direct_compact_info["evict_start_index"]
+                            pre_compact_local_end = write_end_index
+                            preserved_after_tokens = pre_compact_local_end - evict_start_index - num_evicted_tokens
+                            if preserved_after_tokens > 0:
+                                cache["k"][:, evict_start_index:evict_start_index + preserved_after_tokens] = \
+                                    cache["k"][:, evict_start_index + num_evicted_tokens:
+                                               evict_start_index + num_evicted_tokens + preserved_after_tokens].clone()
+                                cache["v"][:, evict_start_index:evict_start_index + preserved_after_tokens] = \
+                                    cache["v"][:, evict_start_index + num_evicted_tokens:
+                                               evict_start_index + num_evicted_tokens + preserved_after_tokens].clone()
 
                 is_recompute = False if update_info is None else update_info.get("is_recompute", False)
                 if not is_recompute:
