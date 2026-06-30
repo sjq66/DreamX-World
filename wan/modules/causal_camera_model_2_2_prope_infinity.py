@@ -197,6 +197,33 @@ class CausalWanSelfAttention(nn.Module):
             record_plan(plan, old_local_end, global_end_index, candidate_starts)
             return plan
 
+        if policy == "pyramid":
+            anchor_chunks = max(0, int(cache_policy.get("stride_anchor_chunks", 1)))
+            long_keep_chunks = max(1, int(cache_policy.get("pyramid_long_keep_chunks", 4)))
+            if len(candidate_starts) <= long_keep_chunks:
+                plan = dict(
+                    fifo_plan,
+                    policy="fifo",
+                    threshold=threshold,
+                    reason="pyramid_under_long_budget",
+                    candidate_starts=candidate_starts,
+                )
+            else:
+                evict_slot = min(anchor_chunks, len(candidate_starts) - 1)
+                plan = {
+                    "evict_start_index": candidate_starts[evict_slot],
+                    "policy": "pyramid",
+                    "best_similarity": None,
+                    "threshold": threshold,
+                    "reason": f"pyramid_long_keep_{long_keep_chunks}_evict",
+                    "candidate_starts": candidate_starts,
+                    "candidate_similarities": [],
+                }
+            if cache_policy_state is not None:
+                cache_policy_state["eviction_plan"] = plan
+            record_plan(plan, old_local_end, global_end_index, candidate_starts)
+            return plan
+
         if policy != "similarity":
             plan = dict(fifo_plan, threshold=threshold, reason=f"unknown_policy_{policy}")
             if cache_policy_state is not None:
@@ -373,8 +400,11 @@ class CausalWanSelfAttention(nn.Module):
             direct_compact_info = None
             policy = cache_policy.get("policy", "fifo") if cache_policy else "fifo"
             num_evicted_tokens = num_new_tokens
-            if policy == "stride" and not is_recompute:
-                recent_keep_chunks = max(0, int(cache_policy.get("recent_keep_chunks", 1)))
+            if policy in ("stride", "pyramid") and not is_recompute:
+                if policy == "pyramid":
+                    recent_keep_chunks = max(0, int(cache_policy.get("pyramid_recent_keep_chunks", 3)))
+                else:
+                    recent_keep_chunks = max(0, int(cache_policy.get("recent_keep_chunks", 1)))
                 anchor_chunks = max(0, int(cache_policy.get("stride_anchor_chunks", 1)))
                 candidate_limit = local_end_index - recent_keep_chunks * num_new_tokens
                 candidate_starts = list(range(
@@ -382,9 +412,10 @@ class CausalWanSelfAttention(nn.Module):
                     candidate_limit - num_new_tokens + 1,
                     num_new_tokens,
                 ))
-                if cache_policy_state is not None and "stride_direct_plan" in cache_policy_state:
-                    plan = cache_policy_state["stride_direct_plan"]
-                elif len(candidate_starts) > anchor_chunks:
+                plan_key = f"{policy}_direct_plan"
+                if cache_policy_state is not None and plan_key in cache_policy_state:
+                    plan = cache_policy_state[plan_key]
+                elif policy == "stride" and len(candidate_starts) > anchor_chunks:
                     plan = {
                         "evict_start_index": candidate_starts[anchor_chunks],
                         "policy": "stride",
@@ -395,7 +426,25 @@ class CausalWanSelfAttention(nn.Module):
                         "candidate_similarities": [],
                     }
                     if cache_policy_state is not None:
-                        cache_policy_state["stride_direct_plan"] = plan
+                        cache_policy_state[plan_key] = plan
+                elif policy == "pyramid" and len(candidate_starts) > max(1, int(cache_policy.get("pyramid_long_keep_chunks", 4))):
+                    long_keep_chunks = max(1, int(cache_policy.get("pyramid_long_keep_chunks", 4)))
+                    evict_slot = min(anchor_chunks, len(candidate_starts) - 1)
+                    plan = {
+                        "evict_start_index": candidate_starts[evict_slot],
+                        "policy": "pyramid",
+                        "best_similarity": None,
+                        "threshold": cache_policy.get("similarity_threshold"),
+                        "reason": f"eager_pyramid_recent_{recent_keep_chunks}_long_{long_keep_chunks}_evict",
+                        "candidate_starts": candidate_starts,
+                        "candidate_similarities": [],
+                    }
+                    if cache_policy_state is not None:
+                        cache_policy_state[plan_key] = plan
+                else:
+                    plan = None
+
+                if plan is not None:
                     stats = cache_policy.get("stats")
                     if isinstance(stats, list):
                         stats.append({
@@ -415,8 +464,6 @@ class CausalWanSelfAttention(nn.Module):
                             "candidate_starts": candidate_starts,
                             "candidate_similarities": [],
                         })
-                else:
-                    plan = None
 
                 if plan is not None:
                     evict_start_index = plan["evict_start_index"]
