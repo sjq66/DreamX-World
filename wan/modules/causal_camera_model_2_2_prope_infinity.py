@@ -141,17 +141,17 @@ class CausalWanSelfAttention(nn.Module):
         if cache_policy_state is not None and "eviction_plan" in cache_policy_state:
             return cache_policy_state["eviction_plan"]
 
-        if not cache_policy or cache_policy.get("policy", "fifo") != "similarity":
-            if cache_policy_state is not None:
-                cache_policy_state["eviction_plan"] = fifo_plan
-            record_plan(fifo_plan)
-            return fifo_plan
-
+        policy = cache_policy.get("policy", "fifo") if cache_policy else "fifo"
         old_local_end = kv_cache["local_end_index"].item()
         global_end_index = kv_cache["global_end_index"].item()
-        threshold = float(cache_policy.get("similarity_threshold", 0.95))
-        recent_keep_chunks = max(0, int(cache_policy.get("recent_keep_chunks", 1)))
-        source = cache_policy.get("similarity_source", "k")
+        threshold = float(cache_policy.get("similarity_threshold", 0.95)) if cache_policy else None
+        recent_keep_chunks = max(0, int(cache_policy.get("recent_keep_chunks", 1))) if cache_policy else 0
+
+        if policy == "fifo":
+            if cache_policy_state is not None:
+                cache_policy_state["eviction_plan"] = fifo_plan
+            record_plan(fifo_plan, old_local_end, global_end_index)
+            return fifo_plan
 
         # First validation keeps the eviction unit equal to the incoming chunk.
         # That preserves chunk boundaries and keeps RoPE on a compact local timeline.
@@ -172,6 +172,39 @@ class CausalWanSelfAttention(nn.Module):
             record_plan(plan, old_local_end, global_end_index, candidate_starts)
             return plan
 
+        if policy == "stride":
+            anchor_chunks = max(0, int(cache_policy.get("stride_anchor_chunks", 1)))
+            if len(candidate_starts) <= anchor_chunks:
+                plan = dict(
+                    fifo_plan,
+                    policy="fifo",
+                    threshold=threshold,
+                    reason="stride_no_middle_candidate",
+                    candidate_starts=candidate_starts,
+                )
+            else:
+                plan = {
+                    "evict_start_index": candidate_starts[anchor_chunks],
+                    "policy": "stride",
+                    "best_similarity": None,
+                    "threshold": threshold,
+                    "reason": f"preserve_{anchor_chunks}_oldest_then_evict",
+                    "candidate_starts": candidate_starts,
+                    "candidate_similarities": [],
+                }
+            if cache_policy_state is not None:
+                cache_policy_state["eviction_plan"] = plan
+            record_plan(plan, old_local_end, global_end_index, candidate_starts)
+            return plan
+
+        if policy != "similarity":
+            plan = dict(fifo_plan, threshold=threshold, reason=f"unknown_policy_{policy}")
+            if cache_policy_state is not None:
+                cache_policy_state["eviction_plan"] = plan
+            record_plan(plan, old_local_end, global_end_index, candidate_starts)
+            return plan
+
+        source = cache_policy.get("similarity_source", "k")
         new_summary = self._build_chunk_summary(
             k[:, :num_new_tokens],
             v[:, :num_new_tokens],

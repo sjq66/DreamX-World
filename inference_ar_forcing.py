@@ -171,7 +171,7 @@ def parse_args():
 
     # KV cache eviction
     parser.add_argument("--kv_evict_policy", type=str, default="fifo",
-                        choices=["fifo", "similarity"],
+                        choices=["fifo", "similarity", "stride"],
                         help="KV cache eviction policy for the AR self-attention cache")
     parser.add_argument("--kv_similarity_threshold", type=float, default=0.95,
                         help="Cosine threshold for similarity-based KV chunk eviction")
@@ -180,6 +180,8 @@ def parse_args():
     parser.add_argument("--kv_similarity_source", type=str, default="k",
                         choices=["k", "v", "kv"],
                         help="Cache tensor used for average-pooled chunk similarity")
+    parser.add_argument("--kv_stride_anchor_chunks", type=int, default=1,
+                        help="For stride eviction, preserve this many oldest non-sink chunks before evicting a middle chunk")
     parser.add_argument("--kv_similarity_debug", action="store_true",
                         help="Print similarity-eviction decisions during AR inference")
     parser.add_argument("--kv_eviction_log_path", type=str, default=None,
@@ -419,6 +421,7 @@ def main():
         "similarity_threshold": args.kv_similarity_threshold,
         "recent_keep_chunks": args.kv_similarity_recent_keep_chunks,
         "similarity_source": args.kv_similarity_source,
+        "stride_anchor_chunks": args.kv_stride_anchor_chunks,
         "debug": args.kv_similarity_debug,
         "stats": [],
     }
@@ -434,7 +437,8 @@ def main():
             "KV cache policy: "
             f"{args.kv_evict_policy}, threshold={args.kv_similarity_threshold}, "
             f"recent_keep_chunks={args.kv_similarity_recent_keep_chunks}, "
-            f"source={args.kv_similarity_source}"
+            f"source={args.kv_similarity_source}, "
+            f"stride_anchor_chunks={args.kv_stride_anchor_chunks}"
         )
     if args.local_attn_size is not None or args.sink_size is not None:
         print(

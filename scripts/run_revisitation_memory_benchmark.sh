@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Core comparison:
 #   small FIFO  : W36 + FIFO
-#   small Ours  : W36 + similarity eviction
+#   small Ours  : W36 + stride/similarity eviction
 #   large FIFO  : W48 + FIFO
 #
 # Usage:
@@ -43,16 +43,18 @@ CUDA_DEVICES="${CUDA_DEVICES:-0}"
 SMALL_LOCAL_ATTN_SIZE="${SMALL_LOCAL_ATTN_SIZE:-36}"
 LARGE_LOCAL_ATTN_SIZE="${LARGE_LOCAL_ATTN_SIZE:-48}"
 SINK_SIZE="${SINK_SIZE:-3}"
+KV_POLICY="${KV_POLICY:-stride}"
 KV_THRESHOLD="${KV_THRESHOLD:-0.90}"
 KV_RECENT_KEEP_CHUNKS="${KV_RECENT_KEEP_CHUNKS:-1}"
 KV_SOURCE="${KV_SOURCE:-v}"
+KV_STRIDE_ANCHOR_CHUNKS="${KV_STRIDE_ANCHOR_CHUNKS:-1}"
 CHUNK_RELATIVE="${CHUNK_RELATIVE:---chunk_relative}"
 
 SMALL_FIFO_DIR="${SMALL_FIFO_DIR:-./outputs_revisit_w${SMALL_LOCAL_ATTN_SIZE}_fifo/}"
-SMALL_OURS_DIR="${SMALL_OURS_DIR:-./outputs_revisit_w${SMALL_LOCAL_ATTN_SIZE}_ours_${KV_SOURCE}_t${KV_THRESHOLD}/}"
+SMALL_OURS_DIR="${SMALL_OURS_DIR:-./outputs_revisit_w${SMALL_LOCAL_ATTN_SIZE}_${KV_POLICY}_${KV_SOURCE}_t${KV_THRESHOLD}/}"
 LARGE_FIFO_DIR="${LARGE_FIFO_DIR:-./outputs_revisit_w${LARGE_LOCAL_ATTN_SIZE}_fifo/}"
 REPORT_DIR="${REPORT_DIR:-./outputs_revisit_memory_report/}"
-EVICTION_LOG="${EVICTION_LOG:-${REPORT_DIR}/kv_eviction_w${SMALL_LOCAL_ATTN_SIZE}_${KV_SOURCE}_t${KV_THRESHOLD}.csv}"
+EVICTION_LOG="${EVICTION_LOG:-${REPORT_DIR}/kv_eviction_w${SMALL_LOCAL_ATTN_SIZE}_${KV_POLICY}_${KV_SOURCE}_t${KV_THRESHOLD}.csv}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 
@@ -100,7 +102,9 @@ echo "Latent frames:      ${NUM_OUTPUT_FRAMES}"
 echo "Small window:       ${SMALL_LOCAL_ATTN_SIZE}"
 echo "Large window:       ${LARGE_LOCAL_ATTN_SIZE}"
 echo "Sink size:          ${SINK_SIZE}"
+echo "KV policy:          ${KV_POLICY}"
 echo "KV source/threshold:${KV_SOURCE}/${KV_THRESHOLD}"
+echo "Stride anchors:     ${KV_STRIDE_ANCHOR_CHUNKS}"
 echo "Report:             ${REPORT_DIR}"
 echo "=============================================="
 
@@ -113,10 +117,10 @@ echo "=============================================="
 echo "[1/4] Running small-window FIFO"
 eval "\"${PYTHON_BIN}\" inference_ar_forcing.py ${COMMON_ARGS} --local_attn_size \"${SMALL_LOCAL_ATTN_SIZE}\" --output_folder \"${SMALL_FIFO_DIR}\" --kv_evict_policy fifo"
 
-echo "[2/4] Running small-window content-aware KV eviction"
+echo "[2/4] Running small-window KV compression"
 mkdir -p "${REPORT_DIR}"
 rm -f "${EVICTION_LOG}"
-eval "\"${PYTHON_BIN}\" inference_ar_forcing.py ${COMMON_ARGS} --local_attn_size \"${SMALL_LOCAL_ATTN_SIZE}\" --output_folder \"${SMALL_OURS_DIR}\" --kv_evict_policy similarity --kv_similarity_threshold \"${KV_THRESHOLD}\" --kv_similarity_recent_keep_chunks \"${KV_RECENT_KEEP_CHUNKS}\" --kv_similarity_source \"${KV_SOURCE}\" --kv_similarity_debug --kv_eviction_log_path \"${EVICTION_LOG}\""
+eval "\"${PYTHON_BIN}\" inference_ar_forcing.py ${COMMON_ARGS} --local_attn_size \"${SMALL_LOCAL_ATTN_SIZE}\" --output_folder \"${SMALL_OURS_DIR}\" --kv_evict_policy \"${KV_POLICY}\" --kv_similarity_threshold \"${KV_THRESHOLD}\" --kv_similarity_recent_keep_chunks \"${KV_RECENT_KEEP_CHUNKS}\" --kv_similarity_source \"${KV_SOURCE}\" --kv_stride_anchor_chunks \"${KV_STRIDE_ANCHOR_CHUNKS}\" --kv_similarity_debug --kv_eviction_log_path \"${EVICTION_LOG}\""
 
 echo "[3/4] Running large-window FIFO"
 eval "\"${PYTHON_BIN}\" inference_ar_forcing.py ${COMMON_ARGS} --local_attn_size \"${LARGE_LOCAL_ATTN_SIZE}\" --output_folder \"${LARGE_FIFO_DIR}\" --kv_evict_policy fifo"
